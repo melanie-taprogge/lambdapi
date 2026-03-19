@@ -4,6 +4,8 @@ TODO
 Index and search
 ----------------
 
+* Add new tactics!
+
 * Too many results found?
 
 anywhere >= (Π x: _, (= _ V# V#))
