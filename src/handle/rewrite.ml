@@ -17,6 +17,12 @@ type eq_config =
   ; symb_eqind : sym (** Induction principle on equality. *)
   ; symb_refl  : sym (** Reflexivity of equality.         *) }
 
+(** Additional configuration needed only when rewrite has to lift an equality
+    over a binder. *)
+type binder_rewrite_config =
+  { symb_arr    : sym (** HOL non-dependent function type constructor. *)
+  ; symb_funext : sym (** Functional extensionality principle.        *) }
+
 (** [get_eq_config ss pos] returns the current configuration for
     equality, used by tactics such as “rewrite” or “reflexivity”. *)
 let get_eq_config : Sig_state.t -> popt -> eq_config = fun ss pos ->
@@ -26,6 +32,15 @@ let get_eq_config : Sig_state.t -> popt -> eq_config = fun ss pos ->
   ; symb_eq    = builtin "eq"
   ; symb_eqind = builtin "eqind"
   ; symb_refl  = builtin "refl" }
+
+(** [get_binder_rewrite_config ss pos] returns the configuration needed for
+    binder-dependent rewrite occurrences. *)
+let get_binder_rewrite_config :
+    Sig_state.t -> popt -> binder_rewrite_config =
+  fun ss pos ->
+  let builtin = Builtin.get ss pos [] in
+  { symb_arr    = builtin "arr"
+  ; symb_funext = builtin "funExt" }
 
 (** [get_eq_data pos cfg a] returns [((a,l,r),[v1;..;vn])] if [a ≡ Π v1:A1,
    .., Π vn:An, P (eq a l r)] and fails otherwise. *)
@@ -370,16 +385,6 @@ type prepared_rewrite =
 (** Equality data being lifted over one or more binders. *)
 type lifted_eq = term * term * term * term
 
-(** Name of the HOL non-dependent function type constructor. *)
-let hol_arrow_name : string = "\226\164\179"
-
-(** [get_symbol_in_scope ss pos name] returns the symbol named [name] in the
-    current scope, and fails at [pos] otherwise. *)
-let get_symbol_in_scope : Sig_state.t -> popt -> string -> sym =
-  fun ss pos name ->
-  try Extra.StrMap.find name ss.Sig_state.in_scope
-  with Not_found -> fatal pos "Unknown symbol %s." name
-
 (** [hol_domain_of_binder cfg pos typ] returns [a] when [typ] is convertible
     to [T a], and fails otherwise. *)
 let hol_domain_of_binder : eq_config -> popt -> term -> term =
@@ -390,11 +395,11 @@ let hol_domain_of_binder : eq_config -> popt -> term -> term =
            "Expected a non-dependent HOL binder type of the form %a _."
            sym cfg.symb_T
 
-(** [hol_arrow_type ss pos dom cod] builds the HOL function type
+(** [hol_arrow_type cfg dom cod] builds the HOL function type
     [dom ⤳ cod]. *)
-let hol_arrow_type : Sig_state.t -> popt -> term -> term -> term =
-  fun ss pos dom cod ->
-  add_args (mk_Symb (get_symbol_in_scope ss pos hol_arrow_name)) [dom; cod]
+let hol_arrow_type : binder_rewrite_config -> term -> term -> term =
+  fun cfg dom cod ->
+  add_args (mk_Symb cfg.symb_arr) [dom; cod]
 
 (** [abstract_over_frame frame t] abstracts [t] over the variable recorded in
     [frame], using the frame's binder type. *)
@@ -410,20 +415,21 @@ let apply_to_frames : term -> binder_frame list -> term =
     (fun frame t -> mk_Appl(t, mk_Vari frame.binder_var))
     frames t
 
-(** [lift_over_frame ss cfg pos frame (a,l,r,p)] lifts the equality data
+(** [lift_over_frame cfg binder_cfg pos frame (a,l,r,p)] lifts the equality data
     [p : P (eq a l r)] over [frame] using [funExt]. *)
 let lift_over_frame :
-    Sig_state.t -> eq_config -> popt -> binder_frame -> lifted_eq
-    -> lifted_eq =
-  fun ss cfg pos frame (eq_type, lhs, rhs, proof) ->
+    eq_config -> binder_rewrite_config -> popt -> binder_frame ->
+    lifted_eq -> lifted_eq =
+  fun cfg binder_cfg pos frame (eq_type, lhs, rhs, proof) ->
   let dom = hol_domain_of_binder cfg pos frame.binder_typ in
   let cod = eq_type in
-  let eq_type = hol_arrow_type ss pos dom cod in
+  let eq_type = hol_arrow_type binder_cfg dom cod in
   let lhs = abstract_over_frame frame lhs in
   let rhs = abstract_over_frame frame rhs in
   let proof = abstract_over_frame frame proof in
-  let fun_ext = get_symbol_in_scope ss pos "funExt" in
-  let proof = add_args (mk_Symb fun_ext) [dom; cod; lhs; rhs; proof] in
+  let proof =
+    add_args (mk_Symb binder_cfg.symb_funext) [dom; cod; lhs; rhs; proof]
+  in
   eq_type, lhs, rhs, proof
 
 (** [prepare_rewrite_under_binders ss cfg pos a l r p found] prepares the
@@ -446,9 +452,10 @@ let prepare_rewrite_under_binders :
       let pred_bind = bind_pattern lhs (found.context found.redex) in
       { eq_type; lhs; rhs; proof; pred_bind; new_term = subst pred_bind rhs }
   | _ ->
+      let binder_cfg = get_binder_rewrite_config ss pos in
       let eq_type, lhs, rhs, proof =
         List.fold_left
-          (fun acc frame -> lift_over_frame ss cfg pos frame acc)
+          (fun acc frame -> lift_over_frame cfg binder_cfg pos frame acc)
           (eq_type, lhs, rhs, proof) relevant
       in
       let z = new_var "z" in
