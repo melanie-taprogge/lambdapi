@@ -204,6 +204,93 @@ let find_subst pos (vars,p) t =
   | None -> no_match ~subterm:true pos p t
   | Some ts -> check_subs pos vars ts; ts
 
+(** Binder frame enclosing a subterm found by [find_subst_under_binders]. *)
+type binder_frame =
+  { binder_var : var
+  ; binder_typ : term }
+
+(** Result of a successful binder-aware rewrite occurrence search. *)
+type subst_under_binders =
+  { subst : term array
+  ; redex : term
+  ; binders : binder_frame list
+  ; context : term -> term }
+
+(** [find_subst_under_binders (xs,p) t] is like [find_subst (xs,p) t], but
+    also records the binders enclosing the matched occurrence and a context
+    rebuilding function for replacing that exact occurrence. The binder list
+    is ordered from innermost to outermost binder. *)
+let find_subst_under_binders :
+    to_subst -> term -> subst_under_binders option =
+  fun xsp t ->
+  let time = Timed.Time.save () in
+  let rec find binders t =
+    if Logger.log_enabled() then
+      log "find_subst_under_binders %a ≡ %a" term (snd xsp) term t;
+    match matching_subs xsp t with
+    | Some subst -> Some { subst; redex = t; binders; context = Fun.id }
+    | None ->
+        begin
+          Timed.Time.restore time;
+          match unfold t with
+          | Appl(a,b) -> find2 binders mk_Appl a b
+          | Abst(a,b) ->
+              find_binder binders (fun a b -> mk_Abst(a,b)) a b
+          | Prod(a,b) ->
+              find_binder binders (fun a b -> mk_Prod(a,b)) a b
+          | LLet(a,c,b) ->
+              find3 binders (fun a c b -> mk_LLet(a,c,b)) a c b
+          | _ -> None
+        end
+  and find2 binders mk a b =
+    match find binders a with
+    | Some r -> Some { r with context = (fun u -> mk (r.context u, b)) }
+    | None ->
+        Timed.Time.restore time;
+        match find binders b with
+        | Some r -> Some { r with context = (fun u -> mk (a, r.context u)) }
+        | None -> None
+  and find3 binders mk a c b =
+    match find binders a with
+    | Some r -> Some { r with context = (fun u -> mk (r.context u) c b) }
+    | None ->
+        Timed.Time.restore time;
+        match find binders c with
+        | Some r -> Some { r with context = (fun u -> mk a (r.context u) b) }
+        | None ->
+            Timed.Time.restore time;
+            let x,b = unbind b in
+            let frame = { binder_var = x; binder_typ = a } in
+            match find (frame::binders) b with
+            | Some r ->
+                let context u = mk a c (bind_var x (r.context u)) in
+                Some { r with context }
+            | None -> None
+  and find_binder binders mk a b =
+    match find binders a with
+    | Some r -> Some { r with context = (fun u -> mk (r.context u) b) }
+    | None ->
+        Timed.Time.restore time;
+        let x,b = unbind b in
+        let frame = { binder_var = x; binder_typ = a } in
+        match find (frame::binders) b with
+        | Some r ->
+            let context u = mk a (bind_var x (r.context u)) in
+            Some { r with context }
+        | None -> None
+  in
+  find [] t
+
+(** [find_subst_under_binders pos (vars,p) t] returns the first occurrence
+    search result for [p] in [t], or fails if no subterm matches. It also
+    checks that all variables in [vars] have been instantiated. *)
+let find_subst_under_binders :
+    popt -> to_subst -> term -> subst_under_binders =
+  fun pos (vars,p) t ->
+  match find_subst_under_binders (vars,p) t with
+  | None -> no_match ~subterm:true pos p t
+  | Some r -> check_subs pos vars r.subst; r
+
 (** [find_subterm_matching p t] tries to find a subterm of [t] that matches
    [p] by instantiating the [TRef]'s of [p].  In case of success, the function
    returns [true]. *)
@@ -271,6 +358,104 @@ let bind_pattern : term -> term -> binder =  fun p t ->
   in
   bind_var z (replace t)
 
+(** Data prepared for the final equality-induction rewrite step. *)
+type prepared_rewrite =
+  { eq_type : term
+  ; lhs : term
+  ; rhs : term
+  ; proof : term
+  ; pred_bind : binder
+  ; new_term : term }
+
+(** Equality data being lifted over one or more binders. *)
+type lifted_eq = term * term * term * term
+
+(** Name of the HOL non-dependent function type constructor. *)
+let hol_arrow_name : string = "\226\164\179"
+
+(** [get_symbol_in_scope ss pos name] returns the symbol named [name] in the
+    current scope, and fails at [pos] otherwise. *)
+let get_symbol_in_scope : Sig_state.t -> popt -> string -> sym =
+  fun ss pos name ->
+  try Extra.StrMap.find name ss.Sig_state.in_scope
+  with Not_found -> fatal pos "Unknown symbol %s." name
+
+(** [hol_domain_of_binder cfg pos typ] returns [a] when [typ] is convertible
+    to [T a], and fails otherwise. *)
+let hol_domain_of_binder : eq_config -> popt -> term -> term =
+  fun cfg pos typ ->
+  match get_args (Eval.whnf [] typ) with
+  | t, [a] when is_symb cfg.symb_T t -> a
+  | _ -> fatal pos
+           "Expected a non-dependent HOL binder type of the form %a _."
+           sym cfg.symb_T
+
+(** [hol_arrow_type ss pos dom cod] builds the HOL function type
+    [dom ⤳ cod]. *)
+let hol_arrow_type : Sig_state.t -> popt -> term -> term -> term =
+  fun ss pos dom cod ->
+  add_args (mk_Symb (get_symbol_in_scope ss pos hol_arrow_name)) [dom; cod]
+
+(** [abstract_over_frame frame t] abstracts [t] over the variable recorded in
+    [frame], using the frame's binder type. *)
+let abstract_over_frame : binder_frame -> term -> term =
+  fun frame t ->
+  mk_Abst(frame.binder_typ, bind_var frame.binder_var t)
+
+(** [apply_to_frames t frames] applies [t] to the variables in [frames]. The
+    frame list must be ordered from innermost to outermost binder. *)
+let apply_to_frames : term -> binder_frame list -> term =
+  fun t frames ->
+  List.fold_right
+    (fun frame t -> mk_Appl(t, mk_Vari frame.binder_var))
+    frames t
+
+(** [lift_over_frame ss cfg pos frame (a,l,r,p)] lifts the equality data
+    [p : P (eq a l r)] over [frame] using [funExt]. *)
+let lift_over_frame :
+    Sig_state.t -> eq_config -> popt -> binder_frame -> lifted_eq
+    -> lifted_eq =
+  fun ss cfg pos frame (eq_type, lhs, rhs, proof) ->
+  let dom = hol_domain_of_binder cfg pos frame.binder_typ in
+  let cod = eq_type in
+  let eq_type = hol_arrow_type ss pos dom cod in
+  let lhs = abstract_over_frame frame lhs in
+  let rhs = abstract_over_frame frame rhs in
+  let proof = abstract_over_frame frame proof in
+  let fun_ext = get_symbol_in_scope ss pos "funExt" in
+  let proof = add_args (mk_Symb fun_ext) [dom; cod; lhs; rhs; proof] in
+  eq_type, lhs, rhs, proof
+
+(** [prepare_rewrite_under_binders ss cfg pos a l r p found] prepares the
+    equality data and rewrite context for an ordinary rewrite occurrence.
+    If the redex is independent from its enclosing binders, the old direct
+    rewrite data is returned. Otherwise, the equality is lifted over the
+    relevant binders and the context abstracts the resulting function-level
+    occurrence. *)
+let prepare_rewrite_under_binders :
+    Sig_state.t -> eq_config -> popt -> term -> term -> term -> term ->
+    subst_under_binders -> prepared_rewrite =
+  fun ss cfg pos eq_type lhs rhs proof found ->
+  let relevant =
+    List.filter
+      (fun frame -> occur frame.binder_var found.redex)
+      found.binders
+  in
+  match relevant with
+  | [] ->
+      let pred_bind = bind_pattern lhs (found.context found.redex) in
+      { eq_type; lhs; rhs; proof; pred_bind; new_term = subst pred_bind rhs }
+  | _ ->
+      let eq_type, lhs, rhs, proof =
+        List.fold_left
+          (fun acc frame -> lift_over_frame ss cfg pos frame acc)
+          (eq_type, lhs, rhs, proof) relevant
+      in
+      let z = new_var "z" in
+      let z_redex = apply_to_frames (mk_Vari z) relevant in
+      let pred_bind = bind_var z (found.context z_redex) in
+      { eq_type; lhs; rhs; proof; pred_bind; new_term = subst pred_bind rhs }
+
 (** [swap cfg a r l t] returns a term of type [P (eq a l r)] from a term [t]
    of type [P (eq a r l)]. *)
 let swap : eq_config -> term -> term -> term -> term -> term =
@@ -325,16 +510,23 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
   let msubst3 (b1, b2, b3) ts = msubst b1 ts, msubst b2 ts, msubst b3 ts in
 
   (* Obtain the different components depending on the pattern. *)
-  let (pred_bind, new_term, t, l, r) =
+  let (a, pred_bind, new_term, t, l, r) =
     match pat with
     (* Simple rewrite, no pattern. *)
     | None ->
         (* Build a substitution from the first instance of [l] in the goal. *)
-        let sigma = find_subst pos (vars, l) g_term in
+        let found = find_subst_under_binders pos (vars, l) g_term in
         (* Build the required data from that substitution. *)
-        let (t, l, r) = msubst3 bound sigma in
-        let pred_bind = bind_pattern l g_term in
-        (pred_bind, subst pred_bind r, t, l, r)
+        let (t, l, r) = msubst3 bound found.subst in
+        let prepared =
+          prepare_rewrite_under_binders ss cfg pos a l r t found
+        in
+        ( prepared.eq_type
+        , prepared.pred_bind
+        , prepared.new_term
+        , prepared.proof
+        , prepared.lhs
+        , prepared.rhs )
 
     (* Basic patterns. *)
     | Some(Rw_Term(p)) ->
@@ -345,7 +537,7 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
         (* Build the data from the substitution. *)
         let (t, l, r) = msubst3 bound sigma in
         let pred_bind = bind_pattern l g_term in
-        (pred_bind, subst pred_bind r, t, l, r)
+        (a, pred_bind, subst pred_bind r, t, l, r)
 
     (* Nested patterns. *)
     | Some(Rw_InTerm(p)) ->
@@ -362,7 +554,7 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
         let (x, p_x) = unbind p_x in
         let pred = subst pred_bind p_x in
         let pred_bind = bind_var x pred in
-        (pred_bind, new_term, t, l, r)
+        (a, pred_bind, new_term, t, l, r)
 
     | Some(Rw_IdInTerm(p)) ->
         (* The code here works as follows: *)
@@ -411,7 +603,7 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
         (* that we use for building the predicate. *)
         let (x, l_x) = unbind pat in
         let pred_bind = bind_var x (subst pred_bind_l l_x) in
-        (pred_bind, new_term, t, l, r)
+        (a, pred_bind, new_term, t, l, r)
 
     (* Combinational patterns. *)
     | Some(Rw_TermInIdInTerm(s,p)) ->
@@ -471,7 +663,7 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
         (* The last step to build the predicate is to substitute
            [l_x] everywhere we find [pat_l] and bind that x. *)
         let pred = subst pred_bind_l l_x in
-        (bind_var x pred, new_term, t, l, r)
+        (a, bind_var x pred, new_term, t, l, r)
 
     | Some(Rw_TermAsIdInTerm(s,p)) ->
         (* This pattern is essentially a let clause.  We first match the value
@@ -501,7 +693,7 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
         let new_term = subst pred_bind p_r in
         let (x, p_x) = unbind p_x in
         let pred_bind = bind_var x (subst pred_bind p_x) in
-        (pred_bind, new_term, t, l, r)
+        (a, pred_bind, new_term, t, l, r)
 
     | Some(Rw_InIdInTerm(q)) ->
         (* This is very similar to the [Rw_IdInTerm] case. Instead of matching
@@ -528,7 +720,7 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
         let new_term = subst pred_bind_l r_val in
         let l_x = subst pat id_x in
         let pred_bind = bind_var x (subst pred_bind_l l_x) in
-        (pred_bind, new_term, t, l, r)
+        (a, pred_bind, new_term, t, l, r)
   in
 
   (* Construct the predicate (context). *)
