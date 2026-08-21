@@ -415,8 +415,8 @@ let apply_to_frames : term -> binder_frame list -> term =
     (fun frame t -> mk_Appl(t, mk_Vari frame.binder_var))
     frames t
 
-(** [lift_over_frame cfg binder_cfg pos frame (a,l,r,p)] lifts the equality data
-    [p : P (eq a l r)] over [frame] using [funExt]. *)
+(** [lift_over_frame cfg binder_cfg pos frame (a,l,r,p)] lifts the equality
+    data [p : P (eq a l r)] over [frame] using [funExt]. *)
 let lift_over_frame :
     eq_config -> binder_rewrite_config -> popt -> binder_frame ->
     lifted_eq -> lifted_eq =
