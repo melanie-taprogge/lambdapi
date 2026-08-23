@@ -373,6 +373,21 @@ let bind_pattern : term -> term -> binder =  fun p t ->
   in
   bind_var z (replace t)
 
+(** [abstract_over_frame frame t] abstracts [t] over the variable recorded in
+    [frame], using the frame's binder type. *)
+let abstract_over_frame : binder_frame -> term -> term =
+  fun frame t ->
+  mk_Abst(frame.binder_typ, bind_var frame.binder_var t)
+
+(** [abstract_over_frames frames t] abstracts [t] over all [frames]. The frame
+    list must be ordered from innermost to outermost binder, and the returned
+    abstractions are nested from outermost to innermost binder. *)
+let abstract_over_frames : binder_frame list -> term -> term =
+  fun frames t ->
+  List.fold_left
+    (fun t frame -> abstract_over_frame frame t)
+    t frames
+
 (** [apply_to_frames t frames] applies [t] to the variables in [frames]. The
     frame list must be ordered from innermost to outermost binder. *)
 let apply_to_frames : term -> binder_frame list -> term =
@@ -381,55 +396,18 @@ let apply_to_frames : term -> binder_frame list -> term =
     (fun frame t -> mk_Appl(t, mk_Vari frame.binder_var))
     frames t
 
-(** How one variable of the equation lhs was instantiated by the first
-    occurrence found under binders. *)
-type binder_occurrence_arg =
-  | Fixed_arg of term
-  | Binder_slot of int
-
-(** [binder_slot_index x frames] returns the position of [x] in [frames], if
-    [x] is one of the recorded binder variables. *)
-let binder_slot_index : var -> binder_frame list -> int option =
-  fun x frames ->
-  let rec find i = function
-    | [] -> None
-    | frame :: frames ->
-        if eq_vars x frame.binder_var then Some i else find (i+1) frames
-  in
-  find 0 frames
-
-(** [classify_occurrence subst frames] classifies the substitution obtained
-    from the first occurrence. Substitutions that are exactly one of the
-    relevant binder variables become binder slots; all others are fixed. *)
-let classify_occurrence :
-    term array -> binder_frame list -> binder_occurrence_arg array =
-  fun subst frames ->
-  Array.map
-    (fun t ->
-       match unfold t with
-       | Vari x ->
-           begin
-             match binder_slot_index x frames with
-             | Some i -> Binder_slot i
-             | None -> Fixed_arg t
-           end
-       | _ -> Fixed_arg t)
-    subst
-
-(** [same_occurrence_class cls frames subst] tells whether [subst], found
-    under [frames], belongs to the occurrence class determined by [cls]. *)
+(** [same_occurrence_class cls frames subst] tells whether [subst], found under
+    [frames], belongs to the occurrence class determined by [cls]. Occurrence
+    arguments are compared after abstraction over the relevant binder frames,
+    so binder-dependent arguments are compared modulo renaming of those
+    enclosing binders. *)
 let same_occurrence_class :
-    binder_occurrence_arg array -> binder_frame list -> term array -> bool =
+    term array -> binder_frame list -> term array -> bool =
   fun cls frames subst ->
   Array.length cls = Array.length subst
   && Array.for_all2
        (fun cls_arg t ->
-          match cls_arg with
-          | Fixed_arg u -> Term.cmp u t = 0
-          | Binder_slot i ->
-              match List.nth_opt frames i, unfold t with
-              | Some frame, Vari x -> eq_vars x frame.binder_var
-              | _ -> false)
+          Term.cmp cls_arg (abstract_over_frames frames t) = 0)
        cls subst
 
 (** [matching_subs_for_replacement xsp t f] tries to match [xsp] against [t]
@@ -453,7 +431,7 @@ let matching_subs_for_replacement :
 let bind_pattern_under_binders :
     var -> to_subst -> subst_under_binders -> binder_frame list -> term -> term =
   fun z xsp first relevant goal ->
-  let cls = classify_occurrence first.subst relevant in
+  let cls = Array.map (abstract_over_frames relevant) first.subst in
   let rec replace binders t =
     let current_relevant =
       List.filter (fun frame -> occur frame.binder_var t) binders
@@ -524,12 +502,6 @@ let hol_domain_of_binder : eq_config -> popt -> term -> term =
 let hol_arrow_type : binder_rewrite_config -> term -> term -> term =
   fun cfg dom cod ->
   add_args (mk_Symb cfg.symb_arr) [dom; cod]
-
-(** [abstract_over_frame frame t] abstracts [t] over the variable recorded in
-    [frame], using the frame's binder type. *)
-let abstract_over_frame : binder_frame -> term -> term =
-  fun frame t ->
-  mk_Abst(frame.binder_typ, bind_var frame.binder_var t)
 
 (** [lift_over_frame cfg binder_cfg pos frame (a,l,r,p)] lifts the equality
     data [p : P (eq a l r)] over [frame] using [funExt]. *)
