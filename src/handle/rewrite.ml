@@ -228,12 +228,10 @@ type binder_frame =
 type subst_under_binders =
   { subst : term array
   ; redex : term
-  ; binders : binder_frame list
-  ; context : term -> term }
+  ; binders : binder_frame list }
 
 (** [find_subst_under_binders (xs,p) t] is like [find_subst (xs,p) t], but
-    also records the binders enclosing the matched occurrence and a context
-    rebuilding function for replacing that exact occurrence. The binder list
+    also records the binders enclosing the matched occurrence. The binder list
     is ordered from innermost to outermost binder. *)
 let find_subst_under_binders :
     to_subst -> term -> subst_under_binders option =
@@ -243,56 +241,46 @@ let find_subst_under_binders :
     if Logger.log_enabled() then
       log "find_subst_under_binders %a ≡ %a" term (snd xsp) term t;
     match matching_subs xsp t with
-    | Some subst -> Some { subst; redex = t; binders; context = Fun.id }
+    | Some subst -> Some { subst; redex = t; binders }
     | None ->
         begin
           Timed.Time.restore time;
           match unfold t with
-          | Appl(a,b) -> find2 binders mk_Appl a b
+          | Appl(a,b) -> find2 binders a b
           | Abst(a,b) ->
-              find_binder binders (fun a b -> mk_Abst(a,b)) a b
+              find_binder binders a b
           | Prod(a,b) ->
-              find_binder binders (fun a b -> mk_Prod(a,b)) a b
+              find_binder binders a b
           | LLet(a,c,b) ->
-              find3 binders (fun a c b -> mk_LLet(a,c,b)) a c b
+              find3 binders a c b
           | _ -> None
         end
-  and find2 binders mk a b =
+  and find2 binders a b =
     match find binders a with
-    | Some r -> Some { r with context = (fun u -> mk (r.context u, b)) }
+    | Some _ as r -> r
     | None ->
         Timed.Time.restore time;
-        match find binders b with
-        | Some r -> Some { r with context = (fun u -> mk (a, r.context u)) }
-        | None -> None
-  and find3 binders mk a c b =
+        find binders b
+  and find3 binders a c b =
     match find binders a with
-    | Some r -> Some { r with context = (fun u -> mk (r.context u) c b) }
+    | Some _ as r -> r
     | None ->
         Timed.Time.restore time;
         match find binders c with
-        | Some r -> Some { r with context = (fun u -> mk a (r.context u) b) }
+        | Some _ as r -> r
         | None ->
             Timed.Time.restore time;
             let x,b = unbind b in
             let frame = { binder_var = x; binder_typ = a } in
-            match find (frame::binders) b with
-            | Some r ->
-                let context u = mk a c (bind_var x (r.context u)) in
-                Some { r with context }
-            | None -> None
-  and find_binder binders mk a b =
+            find (frame::binders) b
+  and find_binder binders a b =
     match find binders a with
-    | Some r -> Some { r with context = (fun u -> mk (r.context u) b) }
+    | Some _ as r -> r
     | None ->
         Timed.Time.restore time;
         let x,b = unbind b in
         let frame = { binder_var = x; binder_typ = a } in
-        match find (frame::binders) b with
-        | Some r ->
-            let context u = mk a (bind_var x (r.context u)) in
-            Some { r with context }
-        | None -> None
+        find (frame::binders) b
   in
   find [] t
 
@@ -521,17 +509,17 @@ let lift_over_frame :
   in
   eq_type, lhs, rhs, proof
 
-(** [prepare_rewrite_under_binders ss cfg pos a l r p found] prepares the
-    equality data and rewrite context for an ordinary rewrite occurrence.
+(** [prepare_rewrite_under_binders ss cfg pos xsp goal a l r p found] prepares
+    the equality data and rewrite context for an ordinary rewrite occurrence.
     If the redex is independent from its enclosing binders, the old direct
     rewrite data is returned. Otherwise, the equality is lifted over the
     relevant binders and the context abstracts the resulting function-level
     occurrence. *)
 let prepare_rewrite_under_binders :
     Sig_state.t -> eq_config -> popt -> to_subst -> term -> term -> term ->
-    term ->
+    term -> term ->
     subst_under_binders -> prepared_rewrite =
-  fun ss cfg pos xsp eq_type lhs rhs proof found ->
+  fun ss cfg pos xsp goal eq_type lhs rhs proof found ->
   let relevant =
     List.filter
       (fun frame -> occur frame.binder_var found.redex)
@@ -539,7 +527,7 @@ let prepare_rewrite_under_binders :
   in
   match relevant with
   | [] ->
-      let pred_bind = bind_pattern lhs (found.context found.redex) in
+      let pred_bind = bind_pattern lhs goal in
       { eq_type; lhs; rhs; proof; pred_bind; new_term = subst pred_bind rhs }
   | _ ->
       let binder_cfg = get_binder_rewrite_config ss pos in
@@ -549,7 +537,6 @@ let prepare_rewrite_under_binders :
           (eq_type, lhs, rhs, proof) relevant
       in
       let z = new_var "z" in
-      let goal = found.context found.redex in
       let pred = bind_pattern_under_binders z xsp found relevant goal in
       let pred_bind = bind_var z pred in
       { eq_type; lhs; rhs; proof; pred_bind; new_term = subst pred_bind rhs }
@@ -619,7 +606,7 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
         let (t, l, r) = msubst3 bound found.subst in
         let prepared =
           prepare_rewrite_under_binders
-            ss cfg pos (vars, lhs_pattern) a l r t found
+            ss cfg pos (vars, lhs_pattern) g_term a l r t found
         in
         ( prepared.eq_type
         , prepared.pred_bind
