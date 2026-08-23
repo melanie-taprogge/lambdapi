@@ -396,11 +396,11 @@ let apply_to_frames : term -> binder_frame list -> term =
     (fun frame t -> mk_Appl(t, mk_Vari frame.binder_var))
     frames t
 
-(** [same_occurrence_class cls frames subst] tells whether [subst], found under
-    [frames], belongs to the occurrence class determined by [cls]. Occurrence
-    arguments are compared after abstraction over the relevant binder frames,
-    so binder-dependent arguments are compared modulo renaming of those
-    enclosing binders. *)
+(** [same_occurrence_class cls frames subst] tells whether [subst], found
+    under [frames], belongs to the occurrence class determined by [cls].
+    Occurrence arguments are compared after abstraction over the relevant
+    binder frames, so binder-dependent arguments are compared modulo renaming
+    of those enclosing binders. *)
 let same_occurrence_class :
     term array -> binder_frame list -> term array -> bool =
   fun cls frames subst ->
@@ -429,7 +429,8 @@ let matching_subs_for_replacement :
     first occurrence's class by a fresh variable applied to the corresponding
     local binder variables. *)
 let bind_pattern_under_binders :
-    var -> to_subst -> subst_under_binders -> binder_frame list -> term -> term =
+    var -> to_subst -> subst_under_binders -> binder_frame list -> term ->
+    term =
   fun z xsp first relevant goal ->
   let cls = Array.map (abstract_over_frames relevant) first.subst in
   let rec replace binders t =
@@ -527,7 +528,8 @@ let lift_over_frame :
     relevant binders and the context abstracts the resulting function-level
     occurrence. *)
 let prepare_rewrite_under_binders :
-    Sig_state.t -> eq_config -> popt -> to_subst -> term -> term -> term -> term ->
+    Sig_state.t -> eq_config -> popt -> to_subst -> term -> term -> term ->
+    term ->
     subst_under_binders -> prepared_rewrite =
   fun ss cfg pos xsp eq_type lhs rhs proof found ->
   let relevant =
