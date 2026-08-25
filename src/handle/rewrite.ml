@@ -92,11 +92,11 @@ type to_subst = var array * term
    [false] otherwise. *)
 let matches : term -> term -> bool =
   let exception Not_equal in
-  let add_eqs = List.fold_left2 (fun l pi ti -> (pi,ti)::l) in
+  let add_eqs xs = List.fold_left2 (fun l pi ti -> (xs,pi,ti)::l) in
   let rec eq l =
     match l with
     | [] -> ()
-    | (p,t)::l ->
+    | (xs,p,t)::l ->
       if Term.cmp p t = 0 then eq l else begin
       let hp, ps, kp = get_args_len p and ht, ts, kt = get_args_len t in
       if Logger.log_enabled() then
@@ -114,9 +114,10 @@ let matches : term -> term -> bool =
         if kp > kt then raise Not_equal;
         let ts1, ts2 = List.cut ts (kt-kp) in
         let u = add_args ht ts1 in
+        if List.exists (fun x -> occur x u) xs then raise Not_equal;
         if Logger.log_enabled() then log (Color.red "<TRef> ≔ %a") term u;
         Timed.(r := Some u);
-        eq (add_eqs l ps ts2)
+        eq (add_eqs xs l ps ts2)
       | Meta _ -> eq l (* We assume that metas can always be instantiated by
                           the corresponding RHS although this might not be the
                           case, in which case tac_refine or solve will later
@@ -128,22 +129,23 @@ let matches : term -> term -> bool =
       | Vari _ ->
         if kp <> kt then raise Not_equal;
         match hp, ht with
-        | Vari x, Vari y when eq_vars x y -> eq (add_eqs l ps ts)
-        | Symb f, Symb g when f == g -> eq (add_eqs l ps ts)
+        | Vari x, Vari y when eq_vars x y -> eq (add_eqs xs l ps ts)
+        | Symb f, Symb g when f == g -> eq (add_eqs xs l ps ts)
         | Abst(a,b), Abst(a',b')
         | Prod(a,b), Prod(a',b') ->
-            let _,b,b' = unbind2 b b' in
-            eq ((a,a')::(b,b')::add_eqs l ps ts)
+            let x,b,b' = unbind2 b b' in
+            eq ((xs,a,a')::(x::xs,b,b')::add_eqs xs l ps ts)
         | LLet(a,c,b), LLet(a',c',b') ->
-            let _,b,b' = unbind2 b b' in
-            eq ((a,a')::(c,c')::(b,b')::add_eqs l ps ts)
+            let x,b,b' = unbind2 b b' in
+            eq ((xs,a,a')::(xs,c,c')::(x::xs,b,b')
+                ::add_eqs xs l ps ts)
         | _ ->
           if Logger.log_enabled() then log "distinct heads";
           raise Not_equal
       end
   in
   fun p t ->
-  let r = try eq [p,t]; true with Not_equal -> false in
+  let r = try eq [[],p,t]; true with Not_equal -> false in
   if Logger.log_enabled() then log "matches result: %b" r; r
 
 let no_match ?(subterm=false) pos p t =
