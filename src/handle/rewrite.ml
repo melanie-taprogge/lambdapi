@@ -473,7 +473,7 @@ type eq_data = term * term * term * term
     to [T a], and fails otherwise. *)
 let hol_domain_of_binder : eq_config -> popt -> term -> term =
   fun cfg pos typ ->
-    (** User rewrite rules must not be used here:
+  (* User rewrite rules must not be used here:
     a type such as [T o] may reduce to the underlying host type [Prop]. *)
   match get_args (Eval.whnf ~tags:[NoRw] [] typ) with
   | t, [a] when is_symb cfg.symb_T t -> a
