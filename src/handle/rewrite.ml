@@ -223,7 +223,8 @@ let find_subst pos (vars,p) t =
 (** Binder frame enclosing a subterm found by [find_subst_under_binders]. *)
 type binder_frame =
   { binder_var : var
-  ; binder_typ : term }
+  ; binder_typ : term
+  ; binder_path : int list }
 
 (** Result of a successful binder-aware rewrite occurrence search. *)
 type subst_under_binders =
@@ -237,8 +238,9 @@ type subst_under_binders =
 let find_subst_under_binders :
     to_subst -> term -> subst_under_binders option = fun xsp t ->
   let time = Timed.Time.save () in
-  let rec find : binder_frame list -> term -> subst_under_binders option =
-    fun binders t ->
+  let rec find :
+      binder_frame list -> int list -> term -> subst_under_binders option =
+    fun binders path t ->
     if Logger.log_enabled() then
       log "find_subst_under_binders %a ≡ %a" term (snd xsp) term t;
     match matching_subs xsp t with
@@ -246,39 +248,44 @@ let find_subst_under_binders :
         begin
           Timed.Time.restore time;
           match unfold t with
-          | Appl(a,b) -> find2 binders a b
-          | Abst(a,b) | Prod(a,b) -> find_binder binders a b
-          | LLet(a,c,b) -> find3 binders a c b
+          | Appl(a,b) -> find2 binders path a b
+          | Abst(a,b) | Prod(a,b) -> find_binder binders path a b
+          | LLet(a,c,b) -> find3 binders path a c b
           | _ -> None
         end
     | Some subst -> Some { subst; redex = t; binders }
-  and find2 binders a b =
-    match find binders a with
-    | None -> Timed.Time.restore time; find binders b
+  and find2 binders path a b =
+    match find binders (0::path) a with
+    | None -> Timed.Time.restore time; find binders (1::path) b
     | r -> r
-  and find3 binders a c b =
-    match find binders a with
+  and find3 binders path a c b =
+    match find binders (0::path) a with
     | Some _ as r -> r
     | None ->
         Timed.Time.restore time;
-        match find binders c with
+        match find binders (1::path) c with
         | None ->
             Timed.Time.restore time;
             let x,b = unbind b in
-            let frame = { binder_var = x; binder_typ = a } in
-            find (frame::binders) b
+            let frame =
+              { binder_var = x; binder_typ = a; binder_path = 2::path }
+            in
+            find (frame::binders) (2::path) b
         | r -> r
   and find_binder :
-      binder_frame list -> term -> binder -> subst_under_binders option =
-    fun binders a b ->
-    match find binders a with
+      binder_frame list -> int list -> term -> binder ->
+      subst_under_binders option =
+    fun binders path a b ->
+    match find binders (0::path) a with
     | None ->
         Timed.Time.restore time;
         let x,b = unbind b in
-        let frame = { binder_var = x; binder_typ = a } in
-        find (frame::binders) b
+        let frame =
+          { binder_var = x; binder_typ = a; binder_path = 1::path }
+        in
+        find (frame::binders) (1::path) b
     | r -> r
-  in find [] t
+  in find [] [] t
 
 (** [find_subst_under_binders pos (vars,p) t] returns the first occurrence
     search result for [p] in [t], or fails if no subterm matches. It also
@@ -379,15 +386,23 @@ let apply_to_frames : term -> binder_frame list -> term =
     (fun frame t -> mk_Appl(t, mk_Vari frame.binder_var))
     frames t
 
-(** [same_occurrence_class cls frames subst] tells whether [subst], found
-    under [frames], belongs to the occurrence class determined by [cls].
-    Occurrence arguments are compared after abstraction over the relevant
-    binder frames, so binder-dependent arguments are compared modulo renaming
-    of those enclosing binders. *)
+(** [same_binder_paths frames frames'] tells whether [frames] and [frames']
+    identify the same original enclosing binders across independent
+    traversals of the goal. *)
+let same_binder_paths : binder_frame list -> binder_frame list -> bool =
+  List.equal (fun f f' -> f.binder_path = f'.binder_path)
+
+(** [same_occurrence_class cls first_frames frames subst] tells whether
+    [subst], found under [frames], belongs to the occurrence class determined
+    by [cls]. Occurrence arguments are compared after abstraction over binder
+    frames, but only after checking that the candidate binders are the same
+    original binders as the first occurrence's binders. *)
 let same_occurrence_class :
-    term array -> binder_frame list -> term array -> bool =
-  fun cls frames subst ->
+    term array -> binder_frame list -> binder_frame list -> term array ->
+    bool =
+  fun cls first_frames frames subst ->
   Array.length cls = Array.length subst
+  && same_binder_paths first_frames frames
   && Array.for_all2 (fun cls_arg t ->
       Term.cmp cls_arg (abstract_over_frames frames t) = 0)
     cls subst
@@ -408,21 +423,22 @@ let matching_subs_for_replacement :
 
 (** [bind_pattern_under_binders z xsp first_subst relevant goal] is the
     binder-aware counterpart of [bind_pattern]. It replaces every occurrence
-    matching the first occurrence's class by [z] applied to the corresponding
+    matching the first occurrence's shape by [z] applied to the corresponding
     local binder variables. *)
 let bind_pattern_under_binders :
     var -> to_subst -> term array -> binder_frame list -> term ->
     term = fun z xsp first_subst relevant goal ->
-  (* Class of instances matching the first occurrence. *)
+  (* Shape of instances matching the first occurrence. *)
   let cls = Array.map (abstract_over_frames relevant) first_subst in
-  let rec replace : binder_frame list -> term -> term = fun binders t ->
+  let rec replace : binder_frame list -> int list -> term -> term =
+    fun binders path t ->
     (* Only those binders occurring in t. *)
     let current_relevant =
       List.filter (fun frame -> occur frame.binder_var t) binders in
     let replacement =
       if List.length current_relevant = List.length relevant then
         matching_subs_for_replacement xsp t (fun subst ->
-          if same_occurrence_class cls current_relevant subst then
+          if same_occurrence_class cls relevant current_relevant subst then
             Some (apply_to_frames (mk_Vari z) current_relevant)
           else None)
       else None
@@ -431,23 +447,33 @@ let bind_pattern_under_binders :
     | Some t -> t
     | None ->
         match unfold t with
-        | Appl(t,u) -> mk_Appl (replace binders t, replace binders u)
+        | Appl(t,u) ->
+            mk_Appl (replace binders (0::path) t,
+                     replace binders (1::path) u)
         | Prod(a,b) ->
             let x,b = unbind b in
-            let frame = { binder_var = x; binder_typ = a } in
-            mk_Prod (replace binders a,
-                     bind_var x (replace (frame::binders) b))
+            let frame =
+              { binder_var = x; binder_typ = a; binder_path = 1::path }
+            in
+            mk_Prod (replace binders (0::path) a,
+                     bind_var x (replace (frame::binders) (1::path) b))
         | Abst(a,b) ->
             let x,b = unbind b in
-            let frame = { binder_var = x; binder_typ = a } in
-            mk_Abst (replace binders a,
-                     bind_var x (replace (frame::binders) b))
+            let frame =
+              { binder_var = x; binder_typ = a; binder_path = 1::path }
+            in
+            mk_Abst (replace binders (0::path) a,
+                     bind_var x (replace (frame::binders) (1::path) b))
         | LLet(typ, def, body) ->
             let x, body = unbind body in
-            let frame = { binder_var = x; binder_typ = typ } in
-            mk_LLet (replace binders typ, replace binders def,
-                     bind_var x (replace (frame::binders) body))
-        | Meta(m,ts) -> mk_Meta (m, Array.map (replace binders) ts)
+            let frame =
+              { binder_var = x; binder_typ = typ; binder_path = 2::path }
+            in
+            mk_LLet (replace binders (0::path) typ,
+                     replace binders (1::path) def,
+                     bind_var x
+                       (replace (frame::binders) (2::path) body))
+        | Meta(m,ts) -> mk_Meta (m, Array.map (replace binders path) ts)
         | Bvar _ -> assert false
         | Wild -> assert false
         | TRef _ -> assert false
@@ -455,7 +481,7 @@ let bind_pattern_under_binders :
         | Plac _ -> assert false
         | _ -> t
   in
-  replace [] goal
+  replace [] [] goal
 
 (** Data prepared for the final equality-induction rewrite step. *)
 type prepared_rewrite =
