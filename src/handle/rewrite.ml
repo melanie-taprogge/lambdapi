@@ -336,6 +336,76 @@ let find_subterm_matching pos p t =
     no_match ~subterm:true pos p t;
   p_refs
 
+(** Term selected by a rewrite selector pattern, together with the binders
+    enclosing the selected occurrence. *)
+type selected_term_under_binders =
+  { selected : term
+  ; selected_binders : binder_frame list }
+
+(** [find_subterm_matching_under_binders p t] is like
+    [find_subterm_matching p t], but it also records the binders enclosing the
+    selected subterm. The binder list is ordered from innermost to outermost
+    binder. *)
+let find_subterm_matching_under_binders :
+    term -> term -> selected_term_under_binders option = fun p t ->
+  let p_refs = replace_wild_by_tref p in
+  let time = Timed.Time.save () in
+  let rec find :
+      binder_frame list -> int list -> term ->
+      selected_term_under_binders option =
+    fun binders path t ->
+    if matches p_refs t then Some
+        { selected = p_refs; selected_binders = binders }
+    else
+      begin
+        Timed.Time.restore time;
+        match unfold t with
+        | Appl(a,b) -> find2 binders path a b
+        | Abst(a,b) | Prod(a,b) -> find_binder binders path a b
+        | LLet(a,c,b) -> find3 binders path a c b
+        | _ -> None
+      end
+  and find2 binders path a b =
+    match find binders (0::path) a with
+    | None -> Timed.Time.restore time; find binders (1::path) b
+    | r -> r
+  and find3 binders path a c b =
+    match find binders (0::path) a with
+    | Some _ as r -> r
+    | None ->
+        Timed.Time.restore time;
+        match find binders (1::path) c with
+        | None ->
+            Timed.Time.restore time;
+            let x,b = unbind b in
+            let frame =
+              { binder_var = x; binder_typ = a; binder_path = 2::path }
+            in
+            find (frame::binders) (2::path) b
+        | r -> r
+  and find_binder :
+      binder_frame list -> int list -> term -> binder ->
+      selected_term_under_binders option =
+    fun binders path a b ->
+    match find binders (0::path) a with
+    | None ->
+        Timed.Time.restore time;
+        let x,b = unbind b in
+        let frame =
+          { binder_var = x; binder_typ = a; binder_path = 1::path }
+        in
+        find (frame::binders) (1::path) b
+    | r -> r
+  in find [] [] t
+
+(** [find_subterm_matching_under_binders pos p t] returns the first selected
+    subterm matching [p] in [t], or fails if no subterm matches. *)
+let find_subterm_matching_under_binders :
+    popt -> term -> term -> selected_term_under_binders = fun pos p t ->
+  match find_subterm_matching_under_binders p t with
+  | None -> no_match ~subterm:true pos p t
+  | Some r -> r
+
 (** [bind_pattern p t] replaces in the term [t] every occurence of the pattern
    [p] by a fresh variable, and returns the binder on this variable. *)
 let bind_pattern : term -> term -> binder =  fun p t ->
@@ -386,26 +456,43 @@ let apply_to_frames : term -> binder_frame list -> term =
     (fun frame t -> mk_Appl(t, mk_Vari frame.binder_var))
     frames t
 
+(** [adapt_to_frames frames frames' t] adapts [t], which may contain the
+    variables bound by [frames], so that it refers to the corresponding
+    variables bound by [frames']. *)
+let adapt_to_frames :
+    binder_frame list -> binder_frame list -> term -> term =
+  fun frames frames' t ->
+  apply_to_frames (abstract_over_frames frames t) frames'
+
 (** [same_binder_paths frames frames'] tells whether [frames] and [frames']
     identify the same original enclosing binders across independent
     traversals of the goal. *)
 let same_binder_paths : binder_frame list -> binder_frame list -> bool =
   List.equal (fun f f' -> f.binder_path = f'.binder_path)
 
-(** [same_occurrence_class cls first_frames frames subst] tells whether
-    [subst], found under [frames], belongs to the occurrence class determined
-    by [cls]. Occurrence arguments are compared after abstraction over binder
-    frames, but only after checking that the candidate binders are the same
-    original binders as the first occurrence's binders. *)
+(** [same_under_binders first_frames frames first t] tells whether [t] is the
+    same term as [first], modulo the fresh variables generated when unbinding
+    the same original enclosing binders. *)
+let same_under_binders :
+    binder_frame list -> binder_frame list -> term -> term -> bool =
+  fun first_frames frames first t ->
+  same_binder_paths first_frames frames
+  && Term.cmp
+       (abstract_over_frames first_frames first)
+       (abstract_over_frames frames t) = 0
+
+(** [same_occurrence_class first_subst first_frames frames subst] tells
+    whether [subst], found under [frames], belongs to the occurrence class
+    determined by [first_subst]. Occurrence arguments are compared with
+    [same_under_binders], so selected occurrences must refer to the same
+    original binders as the first occurrence. *)
 let same_occurrence_class :
     term array -> binder_frame list -> binder_frame list -> term array ->
     bool =
-  fun cls first_frames frames subst ->
-  Array.length cls = Array.length subst
-  && same_binder_paths first_frames frames
-  && Array.for_all2 (fun cls_arg t ->
-      Term.cmp cls_arg (abstract_over_frames frames t) = 0)
-    cls subst
+  fun first_subst first_frames frames subst ->
+  Array.length first_subst = Array.length subst
+  && Array.for_all2 (same_under_binders first_frames frames)
+    first_subst subst
 
 (** [matching_subs_for_replacement xsp t f] tries to match [xsp] against [t]
     and calls [f] with the produced substitution while the matching references
@@ -421,29 +508,15 @@ let matching_subs_for_replacement :
       Timed.Time.restore time;
       result
 
-(** [bind_pattern_under_binders z xsp first_subst relevant goal] is the
-    binder-aware counterpart of [bind_pattern]. It replaces every occurrence
-    matching the first occurrence's shape by [z] applied to the corresponding
-    local binder variables. *)
-let bind_pattern_under_binders :
-    var -> to_subst -> term array -> binder_frame list -> term ->
-    term = fun z xsp first_subst relevant goal ->
-  (* Shape of instances matching the first occurrence. *)
-  let cls = Array.map (abstract_over_frames relevant) first_subst in
+(** [replace_under_binders f goal] traverses [goal] while recording enclosing
+    binder frames. At each subterm [t], [f binders t] may return a
+    replacement. If it does, traversal does not descend below [t]. *)
+let replace_under_binders :
+    (binder_frame list -> term -> term option) -> term -> term =
+  fun f goal ->
   let rec replace : binder_frame list -> int list -> term -> term =
     fun binders path t ->
-    (* Only those binders occurring in t. *)
-    let current_relevant =
-      List.filter (fun frame -> occur frame.binder_var t) binders in
-    let replacement =
-      if List.length current_relevant = List.length relevant then
-        matching_subs_for_replacement xsp t (fun subst ->
-          if same_occurrence_class cls relevant current_relevant subst then
-            Some (apply_to_frames (mk_Vari z) current_relevant)
-          else None)
-      else None
-    in
-    match replacement with
+    match f binders t with
     | Some t -> t
     | None ->
         match unfold t with
@@ -482,6 +555,47 @@ let bind_pattern_under_binders :
         | _ -> t
   in
   replace [] [] goal
+
+(** [bind_pattern_under_binders z xsp first_subst relevant goal] is the
+    binder-aware counterpart of [bind_pattern]. It replaces every occurrence
+    matching the first occurrence's shape by [z] applied to the corresponding
+    local binder variables. *)
+let bind_pattern_under_binders :
+    var -> to_subst -> term array -> binder_frame list -> term ->
+    term = fun z xsp first_subst relevant goal ->
+  let replace binders t =
+    let current_relevant =
+      List.filter (fun frame -> occur frame.binder_var t) binders in
+    if List.length current_relevant = List.length relevant then
+      matching_subs_for_replacement xsp t (fun subst ->
+        if same_occurrence_class first_subst relevant current_relevant subst
+        then Some (apply_to_frames (mk_Vari z) current_relevant)
+        else None)
+    else None
+  in
+  replace_under_binders replace goal
+
+(** [replace_selected_under_binders selected_binders selected replacement
+    goal]
+    replaces every occurrence of [selected] in [goal] by [replacement],
+    adapting references to enclosing binder variables when the same original
+    binder is unbound again while traversing [goal]. *)
+let replace_selected_under_binders :
+    binder_frame list -> term -> term -> term -> term =
+  fun selected_binders selected replacement goal ->
+  let selected_binders =
+    List.filter (fun frame -> occur frame.binder_var selected)
+      selected_binders
+  in
+  let replace binders t =
+    let current_binders =
+      List.filter (fun frame -> occur frame.binder_var t) binders
+    in
+    if same_under_binders selected_binders current_binders selected t then
+      Some (adapt_to_frames selected_binders current_binders replacement)
+    else None
+  in
+  replace_under_binders replace goal
 
 (** Data prepared for the final equality-induction rewrite step. *)
 type prepared_rewrite =
@@ -529,6 +643,27 @@ let lift_over_frame : eq_config -> binder_rewrite_config -> popt ->
   in
   eq_type, lhs, rhs, proof
 
+(** [prepare_eq_data_under_binders ss cfg pos binders redex data] lifts
+    [data] over every enclosing binder on which [redex] depends. It returns
+    the lifted equality data and the relevant binders. *)
+let prepare_eq_data_under_binders :
+    Sig_state.t -> eq_config -> popt -> binder_frame list -> term ->
+    eq_data -> eq_data * binder_frame list =
+  fun ss cfg pos binders redex (eq_type, lhs, rhs, proof) ->
+  let relevant =
+    List.filter (fun frame -> occur frame.binder_var redex) binders
+  in
+  match relevant with
+  | [] -> (eq_type, lhs, rhs, proof), relevant
+  | _ ->
+      let binder_cfg = get_binder_rewrite_config ss pos in
+      let data =
+        List.fold_left
+          (fun acc frame -> lift_over_frame cfg binder_cfg pos frame acc)
+          (eq_type, lhs, rhs, proof) relevant
+      in
+      data, relevant
+
 (** [prepare_rewrite_under_binders ss cfg pos xsp goal eq_data found]
     prepares the equality data and rewrite context for an ordinary rewrite
     occurrence. If the redex is independent from its enclosing binders, the
@@ -539,22 +674,15 @@ let prepare_rewrite_under_binders :
     Sig_state.t -> eq_config -> popt -> to_subst -> term -> eq_data ->
     subst_under_binders -> prepared_rewrite =
   fun ss cfg pos xsp goal (eq_type, lhs, rhs, proof) found ->
-  let relevant =
-    List.filter
-      (fun frame -> occur frame.binder_var found.redex)
-      found.binders
+  let (eq_type, lhs, rhs, proof), relevant =
+    prepare_eq_data_under_binders ss cfg pos found.binders found.redex
+      (eq_type, lhs, rhs, proof)
   in
   match relevant with
   | [] ->
       let pred_bind = bind_pattern lhs goal in
       { eq_type; lhs; rhs; proof; pred_bind; new_term = subst pred_bind rhs }
   | _ ->
-      let binder_cfg = get_binder_rewrite_config ss pos in
-      let eq_type, lhs, rhs, proof =
-        List.fold_left
-          (fun acc frame -> lift_over_frame cfg binder_cfg pos frame acc)
-          (eq_type, lhs, rhs, proof) relevant
-      in
       let z = new_var "z" in
       let pred = bind_pattern_under_binders z xsp found.subst relevant goal in
       let pred_bind = bind_var z pred in
@@ -632,13 +760,21 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
     (* Basic patterns. *)
     | Some(Rw_Term(p)) ->
         (* Find a subterm [match_p] of the goal that matches [p]. *)
-        let match_p = find_subterm_matching pos p g_term in
+        let match_p = find_subterm_matching_under_binders pos p g_term in
+        let lhs_pattern = l in
         (* Build a substitution by matching [match_p] with the LHS [l]. *)
-        let sigma = matching_subs_check_TRef pos (vars,l) match_p in
+        let sigma = matching_subs_check_TRef pos (vars,l) match_p.selected in
         (* Build the data from the substitution. *)
         let (t, l, r) = msubst3 bound sigma in
-        let pred_bind = bind_pattern l g_term in
-        (a, pred_bind, subst pred_bind r, t, l, r)
+        let found =
+          { subst = sigma; redex = match_p.selected
+          ; binders = match_p.selected_binders }
+        in
+        let prepared = prepare_rewrite_under_binders
+            ss cfg pos (vars, lhs_pattern) g_term (a, l, r, t) found
+        in
+        ( prepared.eq_type, prepared.pred_bind, prepared.new_term
+        , prepared.proof, prepared.lhs, prepared.rhs )
 
     (* Nested patterns. *)
     | Some(Rw_InTerm(p)) ->
@@ -674,8 +810,8 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
                in [pred_bind_l]. *)
         let (id,p) = unbind p in
         let p_refs = replace_wild_by_tref p in
-        let sigma = find_subst pos ([|id|],p_refs) g_term in
-        let id_val = sigma.(0) in
+        let selected = find_subst_under_binders pos ([|id|],p_refs) g_term in
+        let id_val = selected.subst.(0) in
         let pat = bind_var id p_refs in
         (* The LHS of the pattern, i.e. the pattern with id replaced by *)
         (* id_val. *)
@@ -687,23 +823,30 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
         (* corresponds to the value we get by applying rewrite to *)
         (* id val. *)
         let (t,l,r) = msubst3 bound sigma in
+        let (a,l,r,t), relevant =
+          prepare_eq_data_under_binders ss cfg pos selected.binders id_val
+            (a, l, r, t)
+        in
 
         (* The RHS of the pattern, i.e. the pattern with id replaced *)
         (* by the result of rewriting id_val. *)
-        let pat_r = subst pat r in
+        let pat_r = subst pat (apply_to_frames r relevant) in
 
         (* Build the predicate, identifying all occurrences of pat_l *)
         (* substituting them, first with pat_r, for the new goal and *)
         (* then with l_x for the lambda term. *)
-        let pred_bind_l = bind_pattern pat_l g_term in
-
-        (* This will be the new goal. *)
-        let new_term = subst pred_bind_l pat_r in
+        let new_term =
+          replace_selected_under_binders selected.binders pat_l pat_r g_term
+        in
 
         (* [l_x] is the pattern with [id] replaced by the variable X *)
         (* that we use for building the predicate. *)
-        let (x, l_x) = unbind pat in
-        let pred_bind = bind_var x (subst pred_bind_l l_x) in
+        let x = new_var "z" in
+        let l_x = subst pat (apply_to_frames (mk_Vari x) relevant) in
+        let pred =
+          replace_selected_under_binders selected.binders pat_l l_x g_term
+        in
+        let pred_bind = bind_var x pred in
         (a, pred_bind, new_term, t, l, r)
 
     (* Combinational patterns. *)
@@ -774,26 +917,40 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
         let s = replace_wild_by_tref s in
         let p_s = subst p s in
         (* Try to match p[s/id] with a subterm of the goal. *)
-        let p = find_subterm_matching pos p_s g_term in
+        let selected = find_subterm_matching_under_binders pos p_s g_term in
         let pat_refs = replace_wild_by_tref pat in
         (* Here we have already asserted tat an instance of p[s/id] exists
            so we know that this will match something. The step is repeated
            in order to get the value of [id]. *)
-        let sub = matching_subs_check_TRef pos ([|id|],pat_refs) p in
+        let sub =
+          matching_subs_check_TRef pos ([|id|],pat_refs) selected.selected
+        in
         let id_val = sub.(0) in
+        let pat = bind_var id pat_refs in
+        let pat_l = subst pat id_val in
         (* This part of the term-building is similar to the previous
            case, as we are essentially rebuilding a term, with some
            subterms that are replaced by new ones. *)
         let sigma = matching_subs_check_TRef pos (vars,l) id_val in
         let (t,l,r) = msubst3 bound sigma in
+        let (a,l,r,t), relevant =
+          prepare_eq_data_under_binders ss cfg pos selected.selected_binders
+            id_val (a, l, r, t)
+        in
 
         (* Now to do some term building. *)
-        let p_x = bind_pattern l p in
-        let p_r = subst p_x r in
-        let pred_bind = bind_pattern p g_term in
-        let new_term = subst pred_bind p_r in
-        let (x, p_x) = unbind p_x in
-        let pred_bind = bind_var x (subst pred_bind p_x) in
+        let pat_r = subst pat (apply_to_frames r relevant) in
+        let new_term =
+          replace_selected_under_binders
+            selected.selected_binders pat_l pat_r g_term
+        in
+        let x = new_var "z" in
+        let p_x = subst pat (apply_to_frames (mk_Vari x) relevant) in
+        let pred =
+          replace_selected_under_binders
+            selected.selected_binders pat_l p_x g_term
+        in
+        let pred_bind = bind_var x pred in
         (a, pred_bind, new_term, t, l, r)
 
     | Some(Rw_InIdInTerm(q)) ->
