@@ -47,7 +47,7 @@ do
         # use builtin strings
         Tactic|1374);;
         # use Tactic
-        first_hyp|all_hyps);;
+        first_hyp|all_hyps|rewrite_under_binder_no_capture);;
         # requires an excluded file
         assume|first_hyp);;
         # default case
