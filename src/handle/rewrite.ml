@@ -665,9 +665,11 @@ let same_under_binders :
     binder_frame list -> binder_frame list -> term -> term -> bool =
   fun first_frames frames first t ->
   same_binder_paths first_frames frames
-  && Term.cmp
+  (* Re-matching can produce the same term with a different binder closure.
+     Compare the opened terms, not their closure representations. *)
+  && LibTerm.eq_alpha
        (abstract_over_frames first_frames first)
-       (abstract_over_frames frames t) = 0
+       (abstract_over_frames frames t)
 
 (** [same_occurrence_class first_subst first_frames frames subst] tells
     whether [subst], found under [frames], belongs to the occurrence class
