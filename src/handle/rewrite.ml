@@ -1171,7 +1171,8 @@ let rewrite : Sig_state.t -> problem -> popt -> goal_typ -> bool ->
     | Some(Rw_InIdInTerm(q)) ->
         (* [in id in context] infers the redex from the lemma and searches
            inside the selected region. Carry the region's binder frames and
-           path into that search, including binders introduced by [context]. *)
+           path into that search, including binders introduced by
+           [context]. *)
         let selected = find_contextual_selection pos q g_term in
         let found =
           match find_subst_under_binders_from
