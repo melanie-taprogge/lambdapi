@@ -30,6 +30,8 @@ for f in *.lp
 do
     f=${f%.lp}
     case $f in
+        # FIXME
+        file.with.dot|req.file.with.dot|indind|why3*);;
         # takes too much time to check
         perf_rw_engine);;
         # commutative and non associative symbol
@@ -38,10 +40,6 @@ do
         262_private_in_lhs);;
         # dedukti SR algorithm fails
         273|813);;
-        # FIXME
-        file.with.dot|req.file.with.dot);;
-        indind);;
-        why3*);;
         # require escaped module name
         π/utf_path|escape_path|'a b/escape file'|require_nondkmident|262_pair_ex_2|require_symbol);;
         # use builtin strings

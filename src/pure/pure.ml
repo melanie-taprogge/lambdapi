@@ -124,6 +124,10 @@ let current_goals : proof_state -> Goal.info list =
   Print.sig_state := st;
   List.map Goal.to_info ps.proof_goals
 
+(** As  explained  in [src/common/error.ml], optional optional source position
+    is used with [Cmd_Error] to distinguish errors that  are  independent from
+    source code position from those where posiotion is expected but is missing
+    *)
 type command_result =
   | Cmd_OK    of state * string option
   | Cmd_Proof of proof_state * ProofTree.t * Pos.popt * Pos.popt
@@ -141,7 +145,7 @@ let set_initial_time : unit -> unit = fun _ ->
 let initial_state : string -> state = fun fname ->
   Console.reset_default ();
   Time.restore Stdlib.(!t0);
-  Package.apply_config fname;
+  Package.set_root_path fname;
   let mp = Library.path_of_file LpLexer.escape fname in
   Sign.loading := [mp];
   let sign = Sign.create mp in
